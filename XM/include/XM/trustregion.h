@@ -12,8 +12,67 @@
 #include <vector>
 #include <fstream>
 #include <Optimization/optimization.h>
+#include <XM/manifold.h>
 
 using namespace std::chrono;
+
+/**
+ * @brief An instance of the Manifold struct for the Stiefel manifold.
+ * 
+ * The Stiefel manifold is the set of all orthonormal k-frames in R^n.
+ * The retraction is based on QR decomposition.
+ * The projection is based on the formula: proj_x(v) = v - x * sym(x^T * v), where sym(A) = (A + A^T)/2.
+ */
+template <typename T>
+Manifold<T> StiefelManifold = {
+    .retraction = [](DeviceDnTen<T>& new_x, const DeviceDnTen<T>& x, const DeviceDnTen<T>& u, double lr) {
+        // Update the point with a scaled tangent vector
+        CHECK_CUBLAS(cublasDaxpy(new_x.cublas_handle, x.total_size, &lr, u.vals, 1, x.vals, 1));
+        // Perform QR decomposition to retract back to the manifold
+        batchedQR(new_x, x, 3, x.total_size / 3);
+    },
+    .projection = [](DeviceDnTen<T>& projected_v, const DeviceDnTen<T>& x, const DeviceDnTen<T>& v) {
+        // Project the ambient vector v onto the tangent space at x
+        opt_var RTgradR({3,3*x.dimensions[0]});
+        opt_var RTgradR_sym({3,3*x.dimensions[0]});
+        DnMatDnMatBatch(x.cublas_handle,RTgradR,x,v,3,x.dimensions[0],3,x.dimensions[0]/3,CUBLAS_OP_T,CUBLAS_OP_N);
+        symBatched(RTgradR_sym.vals,RTgradR.vals,RTgradR.dimensions[0],x.dimensions[0]/3);
+        CHECK_CUBLAS(cublasDcopy(x.cublas_handle, v.total_size, v.vals, 1, projected_v.vals, 1));
+        DnMatDnMatBatch(x.cublas_handle,projected_v,x,RTgradR_sym,x.dimensions[0],3,3,x.dimensions[0]/3,CUBLAS_OP_N,CUBLAS_OP_N,-1.0,1.0);
+    },
+    .inner_product = [](DeviceBlasHandle& cublas_H, const DeviceDnTen<T>& u, const DeviceDnTen<T>& v) {
+        // The inner product on the Stiefel manifold is the standard Euclidean inner product.
+        double result = 0;
+        CHECK_CUBLAS(cublasDdot(cublas_H.cublas_handle, u.total_size, u.vals, 1, v.vals, 1, &result));
+        return result;
+    }
+};
+
+/**
+ * @brief An instance of the Manifold struct for the positive-orthant manifold.
+ * 
+ * The positive-orthant manifold is the set of all vectors with positive entries.
+ * The retraction is based on the exponential map.
+ * The projection is the identity, as the tangent space is the entire Euclidean space.
+ */
+template <typename T>
+Manifold<T> PositiveManifold = {
+    .retraction = [](DeviceDnTen<T>& new_x, const DeviceDnTen<T>& x, const DeviceDnTen<T>& u, double lr) {
+        // Retract along the tangent vector using the exponential map
+        positiveManifoldRetractionKernal<<<(x.total_size + 1023) / 1024, 1024>>>(new_x.vals, x.vals, u.vals, x.total_size, lr);
+    },
+    .projection = [](DeviceDnTen<T>& projected_v, const DeviceDnTen<T>& x, const DeviceDnTen<T>& v) {
+        // The tangent space of the positive orthant is the entire Euclidean space,
+        // so the projection is just the identity.
+        CHECK_CUBLAS(cublasDcopy(x.cublas_handle, v.total_size, v.vals, 1, projected_v.vals, 1));
+    },
+    .inner_product = [](DeviceBlasHandle& cublas_H, const DeviceDnTen<T>& u, const DeviceDnTen<T>& v) {
+        // The inner product on the positive-orthant manifold is the standard Euclidean inner product.
+        double result = 0;
+        CHECK_CUBLAS(cublasDdot(cublas_H.cublas_handle, u.total_size, u.vals, 1, v.vals, 1, &result));
+        return result;
+    }
+};
 
 template <typename T>
 __global__ void positiveManifoldRetractionKernal(T* news, T* olds, T* grad, size_s n, double lr){
@@ -74,7 +133,22 @@ double ProductManifoldInner(DeviceBlasHandle& CUOPT_blas_handle, opt_var &AR,opt
 }
 
 
-void XMtrustregion(opt_var &C, const opt_var &R0, const opt_var &s0, opt_var &R_result, opt_var &s_result,const double lam, double &gradtol, double linesearch_step , opt_var &v , double* primal_value, const double maxtime){
+/**
+ * @brief The main trust region solver.
+ * 
+ * This function implements a trust region algorithm for optimization on a product of manifolds.
+ * 
+ * @param C The cost matrix.
+ * @param vars A vector of variables to optimize.
+ * @param manifolds A vector of manifolds corresponding to the variables.
+ * @param lam The regularization parameter.
+ * @param gradtol The tolerance for the gradient norm.
+ * @param linesearch_step The initial step size for the line search.
+ * @param v A temporary variable used in the solver.
+ * @param primal_value A pointer to store the final primal value.
+ * @param maxtime The maximum time to run the solver.
+ */
+void XMtrustregion(opt_var &C, const std::vector<opt_var*>& vars, const std::vector<Manifold<datatype>>& manifolds, const double lam, double &gradtol, double linesearch_step , opt_var &v , double* primal_value, const double maxtime){
     // initialize
     DeviceBlasHandle CUOPT_blas_handle;
     CUOPT_blas_handle.activate();
@@ -99,7 +173,7 @@ void XMtrustregion(opt_var &C, const opt_var &R0, const opt_var &s0, opt_var &R_
 
     
 
-    size_s o = R0.dimensions[1];
+    size_s o = vars[0]->dimensions[1];
     size_s n = C.dimensions[0]/3;
     size_s dim =  n * (3 * o - 6) + n - 1;
     double delta_bar = sqrt(dim);
@@ -107,18 +181,8 @@ void XMtrustregion(opt_var &C, const opt_var &R0, const opt_var &s0, opt_var &R_
 
     // copy R
     opt_var R({3*n,o});
-    CHECK_CUDA(cudaMemcpy(R.vals, R0.vals, R.total_size * sizeof(datatype), cudaMemcpyDeviceToDevice));
+    CHECK_CUDA(cudaMemcpy(R.vals, vars[0]->vals, R.total_size * sizeof(datatype), cudaMemcpyDeviceToDevice));
     
-    // opt_var R({3*n,o});
-    // // generate r0
-    // std::vector<datatype> R_h(3*o*n,0);
-    // for(size_l i = 0; i<n; ++i){
-    //     R_h[3*i] = 1.0;
-    //     R_h[3*i+3*n+1] = 1.0;
-    //     R_h[3*i+6*n+2] = 1.0;
-    // }
-     
-    // R.SynchronizeHostToDevice(R_h.data());
     //s = ones(n-1,1);
     //s_ex = [1,s];
     // SUPERRRRRRRRR UGLY!!!!!!!!!!
@@ -132,7 +196,7 @@ void XMtrustregion(opt_var &C, const opt_var &R0, const opt_var &s0, opt_var &R_
     s.dimensions[0] = n-1;
     s.total_size = n-1;
     // copy s
-    CHECK_CUDA(cudaMemcpy(s.vals, s0.vals, s.total_size * sizeof(datatype), cudaMemcpyDeviceToDevice));
+    CHECK_CUDA(cudaMemcpy(s.vals, vars[1]->vals, s.total_size * sizeof(datatype), cudaMemcpyDeviceToDevice));
 
     opt_var p_s_ex({n}); //because we reserve the first element to be 1
     std::vector<datatype> p_s_ex_h(n,1);
@@ -302,52 +366,14 @@ void XMtrustregion(opt_var &C, const opt_var &R0, const opt_var &s0, opt_var &R_
     //     end
     //     rgrads = (s.^2).*egrads;
     // end
-    opt_var rgrad_r({o,3*n});
-    opt_var rgrad_s({n-1});
-    auto projection = [&C,&CUOPT_blas_handle,&RTgradR,&RTgradR_sym,&rgrad_r,&rgrad_s](opt_var& R_point, opt_var& s_point, opt_var& R_gradient, opt_var& s_gradient){
-        //round on n
-        size_s n = R_point.dimensions[1]/3;
-        DnMatDnMatBatch(CUOPT_blas_handle,RTgradR,R_point,R_gradient,3,R_point.dimensions[0],3,n,CUBLAS_OP_T,CUBLAS_OP_N);
-        symBatched(RTgradR_sym.vals,RTgradR.vals,RTgradR.dimensions[0],n);
-        CHECK_CUBLAS(cublasDcopy(CUOPT_blas_handle.cublas_handle, R_gradient.total_size, R_gradient.vals, 1, rgrad_r.vals, 1));
-        CHECK_CUDA(cudaDeviceSynchronize());
-        DnMatDnMatBatch(CUOPT_blas_handle,rgrad_r,R_point,RTgradR_sym,R_point.dimensions[0],3,3,n,CUBLAS_OP_N,CUBLAS_OP_N,-1.0,1.0);
-        DnMatDnMatDot(rgrad_s,s_gradient,s_point,2);
-        return;
+    auto projection = [&](opt_var& R_point, opt_var& s_point, opt_var& R_gradient, opt_var& s_gradient){
+        manifolds[0].projection(rgrad_r, R_point, R_gradient);
+        manifolds[1].projection(rgrad_s, s_point, s_gradient);
     };
 
-    //function [newR,news] = retraction(rgradR,rgrads,R,s,lr)
-    //     n = size(R,1)/3;
-    //     for i = 1:n
-    //         [q,r] = qr(R(3*i-2:3*i,:)-lr*rgradR(3*i-2:3*i,:));
-    //         sig = sign(diag(r));
-    //         newR(3*i-2:3*i,:) = q.*sig';
-    //     end
-    //     news = s.*exp(-lr*rgrads./s);
-    // end
-    opt_var new_R_T({o,3*n});
-    opt_var new_R_T_test({o,3});
-    opt_var new_R({3*n,o});
-    opt_var new_s_ex({n}); //because we reserve the first element to be 1
-    std::vector<datatype> new_s_ex_h(n,1);
-    new_s_ex.SynchronizeHostToDevice(new_s_ex_h.data());
-    opt_var new_s; //because we reserve the first element to be 1
-    new_s.vals = new_s_ex.vals+1;
-    new_s.num_dims = 1;
-    new_s.dimensions = new size_s[1];
-    new_s.dimensions[0] = n-1;
-    new_s.total_size = n-1;
-
-    auto retraction = [&CUOPT_blas_handle,&new_R_T,&new_s](opt_var& R_point, opt_var& s_point, opt_var& rR_gradient, opt_var& rs_gradient, double lr){
-        // annoying thing is qr cannot explicitly return q and r
-        // we can calculate q ourselves
-        CHECK_CUBLAS(cublasDaxpy(CUOPT_blas_handle.cublas_handle, R_point.total_size, &lr, rR_gradient.vals, 1, R_point.vals, 1));
-
-        batchedQR(new_R_T,R_point,3,s_point.total_size+1);
-        //batchedQR(new_R_T_test,R_point,3,1);
-        //new_R_T.print();
-        positiveManifoldRetractionKernal<<<(s_point.total_size + 1024 - 1) / 1024,1024>>>(new_s.vals,s_point.vals,rs_gradient.vals,s_point.total_size,lr);
-        return;
+    auto retraction = [&](opt_var& R_point, opt_var& s_point, opt_var& rR_gradient, opt_var& rs_gradient, double lr){
+        manifolds[0].retraction(new_R_T, R_point, rR_gradient, lr);
+        manifolds[1].retraction(new_s, s_point, rs_gradient, lr);
     };
 
     opt_var R_T({o,3*n});
